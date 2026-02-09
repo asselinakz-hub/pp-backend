@@ -112,3 +112,21 @@ def complete(inp: CompleteIn):
         buttons=buttons
     )
     return {"ok": True}
+    
+from fastapi import FastAPI, HTTPException
+from supabase import create_client
+import os
+
+app = FastAPI()
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # важно: service role
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+
+@app.get("/api/token/{token}")
+def get_token(token: str):
+    r = supabase.table("tokens").select("token,status,completed_at,telegram_chat_id").eq("token", token).limit(1).execute()
+    rows = (r.data or [])
+    if not rows:
+        raise HTTPException(status_code=404, detail="token_not_found")
+    return rows[0]
