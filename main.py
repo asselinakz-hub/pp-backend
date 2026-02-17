@@ -1,6 +1,8 @@
 import os
 import secrets
 from datetime import datetime, timezone
+import stripe
+from fastapi.responses import JSONResponse
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -19,6 +21,15 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 APP_URL = os.getenv("APP_URL", "").rstrip("/")  # Streamlit URL, без / в конце
 TG_GROUP_INVITE_LINK = os.getenv("TG_GROUP_INVITE_LINK", "")
 PAY_URL = os.getenv("PAY_URL", "")  # optional
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     # Render покажет это в логах при старте
@@ -100,6 +111,98 @@ def get_token(token: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"server_error: {e}")
 
+@app.post("/pay/create-checkout")
+def create_checkout(token: str):
+    """
+    token = твой link_token из таблицы link_tokens
+    Возвращаем url Stripe Checkout, куда бот/пользователь перейдёт
+    """
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=500, detail="stripe_not_configured")
+
+    # 1) проверяем токен
+    r = sb.table(TOKENS_TABLE).select("*").eq("token", token).limit(1).execute()
+    row = (r.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=404, detail="token_not_found")
+
+    # если уже оплачено — не создаём заново
+    if row.get("payment_status") == "paid":
+        return {"ok": True, "already_paid": True, "checkout_url": None}
+
+    # 2) создаём Checkout Session
+    # ВАЖНО: metadata — чтобы в webhook понять, что именно оплатили
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=STRIPE_SUCCESS_URL or "https://t.me/",
+        cancel_url=STRIPE_CANCEL_URL or "https://t.me/",
+        metadata={
+            "token": token,
+            "tg_chat_id": str(row.get("tg_chat_id") or ""),
+        },
+    )
+
+    # 3) сохраняем session_id
+    sb.table(TOKENS_TABLE).update(
+        {"stripe_session_id": session.id, "payment_status": "pending"}
+    ).eq("token", token).execute()
+
+    return {"ok": True, "checkout_url": session.url, "session_id": session.id}
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="missing_STRIPE_WEBHOOK_SECRET")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid_webhook: {e}")
+
+    # Нас интересует успешная оплата
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        token = (session.get("metadata") or {}).get("token")
+        tg_chat_id = (session.get("metadata") or {}).get("tg_chat_id")
+
+        if token:
+            # отмечаем оплату
+            sb.table(TOKENS_TABLE).update(
+                {
+                    "payment_status": "paid",
+                    "paid_at": utcnow_iso(),
+                    "stripe_session_id": session.get("id"),
+                    "stripe_customer_email": (session.get("customer_details") or {}).get("email"),
+                    "status": "paid",  # можно держать отдельно от completed, как хочешь
+                }
+            ).eq("token", token).execute()
+
+        # отправляем пользователю сообщение в TG
+        if tg_chat_id:
+            # тут ты даёшь ссылку на платформу (например APP_URL + /?token=... или отдельный доступ)
+            # пока сделаем просто "переход в платформу"
+            platform_link = APP_URL  # лучше потом сделать персональный доступ
+            buttons = [
+                [{"text": "💠 Открыть платформу", "url": platform_link}],
+            ]
+            if TG_GROUP_INVITE_LINK:
+                buttons.append([{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}])
+
+            tg_send(
+                str(tg_chat_id),
+                "✅ Оплата прошла! Вот ваши материалы и доступ:",
+                buttons=buttons,
+            )
+
+    return JSONResponse({"ok": True})
 
 # -------------------------
 # Telegram webhook handler
@@ -187,16 +290,43 @@ def complete(inp: CompleteIn):
         if not chat_id:
             return {"ok": False, "err": "tg_chat_id_missing"}
 
-        buttons = [[{"text": "🔥 Войти в группу разбора", "url": TG_GROUP_INVITE_LINK}]]
-        if PAY_URL:
-            buttons.append([{"text": "💎 Платная консультация", "url": PAY_URL}])
+        
+        # создаём checkout-ссылку на оплату
+        checkout_url = None
+        try:
+            # создаём оплату по токену
+            # ВАЖНО: inp.token — это тот же token
+            resp = requests.post(
+                f"{os.getenv('API_BASE_URL','')}/pay/create-checkout",
+                params={"token": inp.token},
+                timeout=12,
+            )
+            if resp.status_code == 200:
+                checkout_url = (resp.json() or {}).get("checkout_url")
+        except Exception:
+            checkout_url = None
+        
+        buttons = []
 
+        # кнопка оплаты
+        if checkout_url:
+            buttons.append(
+                [{"text": "💳 Получить расширенный доступ за $19", "url": checkout_url}]
+            )
+
+        # клуб (опционально)
+        if TG_GROUP_INVITE_LINK:
+            buttons.append(
+                [{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}]
+            )
+        
         tg_send(
             str(chat_id),
             f"✅ {inp.client_name or 'Готово'}! Диагностика завершена.\n\nВыбирай следующий шаг:",
             buttons=buttons,
         )
-
+        
+        
         return {"ok": True}
 
     except Exception as e:
