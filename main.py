@@ -235,7 +235,23 @@ async def tg_webhook(req: Request):
                     buttons=[[{"text": "🚀 Начать диагностику", "url": link}]],
                 )
                 return {"ok": True}
+            if action.startswith("pdf_ok:"):
+                token = action.split("pdf_ok:", 1)[1].strip()
 
+                tg_send(
+                    chat_id,
+                    "🔥 Тогда самое интересное:\n\n"
+                    "Я могу раскрыть твой профиль глубже и дать:\n"
+                    "• расширенный отчёт\n"
+                    "• 3 фокуса\n"
+                    "• простую реализацию (что делать каждый день)\n\n"
+                    "Хочешь посмотреть превью, как это выглядит?",
+                    buttons=[
+                        [{"text": "👀 Показать превью", "callback_data": f"offer:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": "remind_later"}],
+                    ],
+                )
+                return {"ok": True}
             # пользователь: "да, PDF скачал"
             if action.startswith("pdf_ok:"):
                 token = action.split("pdf_ok:", 1)[1].strip()
@@ -331,28 +347,40 @@ async def tg_webhook(req: Request):
 
         # ---------- TEXT MESSAGES ----------
         text = (data.get("message", {}) or {}).get("text", "") or ""
-        text = text.strip()
+        if not chat_id:
+            return {"ok": True}
 
-        # /start (с payload или без)
+        # 1) /start с payload (токеном)
         if text.startswith("/start"):
             parts = text.split(maxsplit=1)
-            payload = parts[1].strip() if len(parts) > 1 else ""
+            start_payload = parts[1].strip() if len(parts) > 1 else ""
 
-            if payload:
-                token = payload
-                upsert_chat_for_token(token, chat_id)
+            # если пришли из диагностики — payload это token
+            if start_payload:
+                token = start_payload
+
+                # привязываем chat_id к token (важно!)
+                sb.table(TOKENS_TABLE).update({"tg_chat_id": chat_id}).eq("token", token).execute()
 
                 tg_send(
                     chat_id,
-                    "✨ <b>Ты на финише!</b>\n\n"
-                    "Судя по всему, ты вернулся(лась) после диагностики.\n\n"
-                    "Скажи честно: PDF уже скачал(а)?",
+                    "✅ Я вижу, что ты вернулся из диагностики.\n\n"
+                    "Скачал(а) PDF-отчёт?\n"
+                    "Если да — покажу следующий шаг 👇",
                     buttons=[
-                        [{"text": "📄 Да, скачал(а)", "callback_data": f"pdf_ok:{token}"}],
-                        [{"text": "↩️ Открыть PDF ещё раз", "url": f"{APP_URL}/?t={token}"}],
+                        [{"text": "📥 Я скачал(а) PDF", "callback_data": f"pdf_ok:{token}"}],
+                        [{"text": "↩️ Открыть диагностику ещё раз", "url": f"{APP_URL}/?t={token}"}],
                     ],
                 )
                 return {"ok": True}
+
+            # обычный /start без токена
+            tg_send(
+                chat_id,
+                "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
+                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
+            )
+            return {"ok": True}
 
             # обычный старт без payload
             tg_send(
