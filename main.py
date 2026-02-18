@@ -347,6 +347,45 @@ async def tg_webhook(req: Request):
 
         # ---------- TEXT MESSAGES ----------
         text = (data.get("message", {}) or {}).get("text", "") or ""
+        text_clean = text.strip()
+
+        # --- 1) Пользователь нажал "Показать превью" (это обычный текст) ---
+        if text_clean in ("👀 Показать превью", "Показать превью"):
+            # найдём самый свежий token для этого chat_id
+            r = (
+                sb.table(TOKENS_TABLE)
+                .select("token,created_at")
+                .eq("tg_chat_id", chat_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            row = (r.data or [None])[0]
+            token = (row or {}).get("token")
+
+            if not token:
+                tg_send(chat_id, "Я не вижу твою последнюю диагностику 😕 Нажми «✨ Начать» ещё раз.")
+                return {"ok": True}
+
+            tg_send(
+                chat_id,
+            "👀 Превью расширения:\n\n"
+                "✅ 1) Расширенный отчёт — глубже, точнее, с расшифровкой твоих механизмов\n"
+                "✅ 2) 3 фокуса на ближайшие недели (без воды)\n"
+                "✅ 3) Простая реализация: что делать каждый день, чтобы реально сдвинуться\n\n"
+                "Хочешь, я открою полный доступ?",
+                buttons=[
+                    [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
+                    [{"text": "⏳ Позже", "callback_data": "remind_later"}],
+                ],
+            )
+            return {"ok": True}
+
+        # --- 2) Пользователь нажал "Позже" (это тоже текст) ---
+        if text_clean in ("⏳ Позже", "Позже"):
+            tg_send(chat_id, "Ок 🙂 Я тут. Когда будешь готов — нажми «Показать превью».")
+            return {"ok": True}
+        
         if not chat_id:
             return {"ok": True}
 
