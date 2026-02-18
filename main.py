@@ -233,18 +233,38 @@ async def tg_webhook(req: Request):
         if not chat_id:
             return {"ok": True}
 
-        if text in ("/start", "start", "Start", "начать", "Начать"):
-            tg_send(
-                chat_id,
-                "Привет! Я бот диагностики Personal Potentials.\n\nНажми кнопку — я выдам персональную ссылку.",
-                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
-            )
-        else:
-            tg_send(
-                chat_id,
-                "Нажми «✨ Начать», и я выдам персональную ссылку.",
-                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
-            )
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            start_payload = parts[1].strip() if len(parts) > 1 else ""
+
+            # если пришли из диагностики — payload это token
+            if start_payload:
+                token = start_payload
+
+                # сохраняем, что этот chat_id привязан к token (на всякий)
+                sb.table(TOKENS_TABLE).update(
+                    {"tg_chat_id": chat_id}
+                ).eq("token", token).execute()
+
+                tg_send(
+                    chat_id,
+                    "Ты вернулся из диагностики ✅\n\n"
+                    "Если ты ещё проходишь — нажми «Продолжить».\n"
+                    "Если уже закончил — нажми «Я прошёл ✅».",
+                    buttons=[
+                        [{"text": "▶️ Продолжить диагностику", "url": f"{APP_URL}/?t={token}"}],
+                        [{"text": "✅ Я прошёл", "callback_data": f"done:{token}"}],
+                    ],
+                )
+                return {"ok": True}
+
+    # обычный старт (без payload)
+    tg_send(
+        chat_id,
+        "Привет! Нажми кнопку — я выдам персональную ссылку.",
+        buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
+    )
+    return {"ok": True}
 
         return {"ok": True}
 
