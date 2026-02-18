@@ -45,11 +45,16 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def tg_send(chat_id: str, text: str, buttons=None):
+def tg_send(chat_id: str, text: str, buttons=None, disable_preview: bool = False):
     if not TG_BOT_TOKEN:
         raise RuntimeError("Missing TG_BOT_TOKEN")
 
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+    }
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
 
@@ -60,6 +65,23 @@ def tg_send(chat_id: str, text: str, buttons=None):
     )
     if r.status_code >= 400:
         raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text}")
+
+
+def tg_answer_callback(callback_query_id: str, text: str = ""):
+    """ВАЖНО: убирает 'loading...' на нажатой inline-кнопке."""
+    if not TG_BOT_TOKEN:
+        raise RuntimeError("Missing TG_BOT_TOKEN")
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/answerCallbackQuery",
+        json=payload,
+        timeout=12,
+    )
+    # тут не валим сервер, даже если не получилось
+    return r.status_code < 400
 
 
 def issue_link(chat_id: str, source="tg", campaign=""):
@@ -90,12 +112,18 @@ def upsert_chat_for_token(token: str, chat_id: str):
         pass
 
 
-def build_tg_return_link(token: str) -> str:
-    # в start payload нельзя пробелы, лучше не усложнять
-    # Telegram допускает payload до 64 символов — наш token_urlsafe обычно ок
-    if not TG_BOT_USERNAME:
-        return "https://t.me/"
-    return f"https://t.me/{TG_BOT_USERNAME}?start={token}"
+def get_latest_token_for_chat(chat_id: str) -> str | None:
+    r = (
+        sb.table(TOKENS_TABLE)
+        .select("token,created_at")
+        .eq("tg_chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    row = (r.data or [None])[0]
+    token = (row or {}).get("token")
+    return token
 
 
 def create_checkout_for_token(token: str, chat_id: str) -> str:
@@ -108,7 +136,7 @@ def create_checkout_for_token(token: str, chat_id: str) -> str:
         raise HTTPException(status_code=404, detail="token_not_found")
 
     if row.get("payment_status") == "paid":
-        return ""
+        return ""  # уже оплачено
 
     session = stripe.checkout.Session.create(
         mode="payment",
@@ -214,19 +242,23 @@ async def stripe_webhook(request: Request):
 async def tg_webhook(req: Request):
     try:
         data = await req.json()
-        msg = data.get("message") or (data.get("callback_query") or {}).get("message") or {}
-        chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
 
-        if not chat_id:
-            return {"ok": True}
-
-        # ---------- CALLBACKS ----------
+        # 1) Callback query (нажатие inline-кнопок)
         cb = data.get("callback_query")
         if cb:
+            cb_id = cb.get("id", "")
+            msg = cb.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id") or "")
             action = (cb.get("data") or "").strip()
 
-            # старт диагностики
+            if cb_id:
+                tg_answer_callback(cb_id)
+
+            if not chat_id:
+                return {"ok": True}
+
+            # START DIAG
             if action == "start_diag":
                 link = issue_link(chat_id, source="tg")
                 tg_send(
@@ -235,24 +267,8 @@ async def tg_webhook(req: Request):
                     buttons=[[{"text": "🚀 Начать диагностику", "url": link}]],
                 )
                 return {"ok": True}
-            if action.startswith("pdf_ok:"):
-                token = action.split("pdf_ok:", 1)[1].strip()
 
-                tg_send(
-                    chat_id,
-                    "🔥 Тогда самое интересное:\n\n"
-                    "Я могу раскрыть твой профиль глубже и дать:\n"
-                    "• расширенный отчёт\n"
-                    "• 3 фокуса\n"
-                    "• простую реализацию (что делать каждый день)\n\n"
-                    "Хочешь посмотреть превью, как это выглядит?",
-                    buttons=[
-                        [{"text": "👀 Показать превью", "callback_data": f"offer:{token}"}],
-                        [{"text": "⏳ Позже", "callback_data": "remind_later"}],
-                    ],
-                )
-                return {"ok": True}
-            # пользователь: "да, PDF скачал"
+            # PDF OK
             if action.startswith("pdf_ok:"):
                 token = action.split("pdf_ok:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
@@ -260,39 +276,40 @@ async def tg_webhook(req: Request):
                 tg_send(
                     chat_id,
                     "Супер ✅\n\n"
-                    "Тогда самый интересный вопрос: хочешь увидеть <b>превью</b> расширенного отчёта?\n\n"
+                    "Хочешь посмотреть <b>превью</b> расширенного отчёта?\n"
                     "Я покажу, какие блоки там есть и чем он отличается от бесплатного.",
                     buttons=[
                         [{"text": "👀 Показать превью", "callback_data": f"preview:{token}"}],
-                        [{"text": "🕒 Напомнить позже", "callback_data": f"later:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # превью расширения (мягко, без цены в лоб)
+            # PREVIEW
             if action.startswith("preview:"):
                 token = action.split("preview:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
 
+                # ВАЖНО: тут лучше НЕ надеяться на кликабельность превью-картинки.
+                # Даем понятную кнопку и в тексте можно дать ссылку.
                 tg_send(
                     chat_id,
                     "👀 <b>Превью расширенной версии</b>\n\n"
                     "Внутри будет:\n"
-                    "• более точная расшифровка твоих сильных сторон (на языке поведения)\n"
-                    "• где ты теряешь энергию и почему\n"
-                    "• 3 фокуса на ближайшие недели\n"
-                    "• «реализация» — понятный план действий\n\n"
-                    "Если хочешь — я открою доступ одним кликом.",
+                    "✅ 1) Расширенный отчёт — глубже, точнее, с расшифровкой твоих механизмов\n"
+                    "✅ 2) 3 фокуса на ближайшие недели (без воды)\n"
+                    "✅ 3) Простая реализация: что делать каждый день, чтобы реально сдвинуться\n\n"
+                    "Если хочешь — я открою доступ одним кликом 👇",
                     buttons=[
-                        [{"text": "💎 Хочу открыть доступ", "callback_data": f"unlock:{token}"}],
-                        [{"text": "↩️ Вернуться", "callback_data": f"welcome:{token}"}],
+                        [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # только тут создаём оплату
-            if action.startswith("unlock:"):
-                token = action.split("unlock:", 1)[1].strip()
+            # PAY (создаем оплату)
+            if action.startswith("pay:"):
+                token = action.split("pay:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
 
                 try:
@@ -308,33 +325,32 @@ async def tg_webhook(req: Request):
                 tg_send(
                     chat_id,
                     "Готово ✅\n\n"
-                    "Я подготовила оплату. После оплаты я автоматически пришлю доступ.",
+                    "Перейди к оплате по кнопке ниже. После оплаты я автоматически пришлю доступ.",
                     buttons=[
                         [{"text": "💳 Перейти к оплате", "url": checkout_url}],
-                        [{"text": "🕒 Подумать позже", "callback_data": f"later:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # напомнить позже
-            if action.startswith("later:"):
-                token = action.split("later:", 1)[1].strip()
+            # LATER / REMIND_LATER
+            if action == "remind_later" or action.startswith("later:"):
                 tg_send(
                     chat_id,
                     "Ок 🙂\n\n"
-                    "Когда будешь готов — просто напиши <b>превью</b> (и я покажу ещё раз).",
+                    "Когда будешь готов — напиши <b>превью</b> или нажми кнопку «👀 Показать превью», и я покажу снова.",
                 )
                 return {"ok": True}
 
-            # повторить “welcome”
+            # WELCOME (вернуться к вопросу про PDF)
             if action.startswith("welcome:"):
                 token = action.split("welcome:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
 
                 tg_send(
                     chat_id,
-                    "✅ Ты вернулся из диагностики.\n\n"
-                    "Небольшой момент: ты успел(а) скачать PDF?\n\n"
+                    "✅ Ты вернулся(ась) из диагностики.\n\n"
+                    "Скачал(а) PDF?\n\n"
                     "Если нет — открою диагностику снова на твоей ссылке.",
                     buttons=[
                         [{"text": "📄 Я скачал(а) PDF", "callback_data": f"pdf_ok:{token}"}],
@@ -345,65 +361,28 @@ async def tg_webhook(req: Request):
 
             return {"ok": True}
 
-        # ---------- TEXT MESSAGES ----------
-        text = (data.get("message", {}) or {}).get("text", "") or ""
-        text_clean = text.strip()
+        # 2) Обычные сообщения (message.text)
+        msg = data.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        text = (msg.get("text") or "").strip()
 
-        # --- 1) Пользователь нажал "Показать превью" (это обычный текст) ---
-        if text_clean in ("👀 Показать превью", "Показать превью"):
-            # найдём самый свежий token для этого chat_id
-            r = (
-                sb.table(TOKENS_TABLE)
-                .select("token,created_at")
-                .eq("tg_chat_id", chat_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            row = (r.data or [None])[0]
-            token = (row or {}).get("token")
-
-            if not token:
-                tg_send(chat_id, "Я не вижу твою последнюю диагностику 😕 Нажми «✨ Начать» ещё раз.")
-                return {"ok": True}
-
-            tg_send(
-                chat_id,
-            "👀 Превью расширения:\n\n"
-                "✅ 1) Расширенный отчёт — глубже, точнее, с расшифровкой твоих механизмов\n"
-                "✅ 2) 3 фокуса на ближайшие недели (без воды)\n"
-                "✅ 3) Простая реализация: что делать каждый день, чтобы реально сдвинуться\n\n"
-                "Хочешь, я открою полный доступ?",
-                buttons=[
-                    [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
-                    [{"text": "⏳ Позже", "callback_data": "remind_later"}],
-                ],
-            )
-            return {"ok": True}
-
-        # --- 2) Пользователь нажал "Позже" (это тоже текст) ---
-        if text_clean in ("⏳ Позже", "Позже"):
-            tg_send(chat_id, "Ок 🙂 Я тут. Когда будешь готов — нажми «Показать превью».")
-            return {"ok": True}
-        
         if not chat_id:
             return {"ok": True}
 
-        # 1) /start с payload (токеном)
+        # /start с payload
         if text.startswith("/start"):
             parts = text.split(maxsplit=1)
             start_payload = parts[1].strip() if len(parts) > 1 else ""
 
-            # если пришли из диагностики — payload это token
+            # Если пришли из диагностики: payload == token
             if start_payload:
                 token = start_payload
-
-                # привязываем chat_id к token (важно!)
-                sb.table(TOKENS_TABLE).update({"tg_chat_id": chat_id}).eq("token", token).execute()
+                upsert_chat_for_token(token, chat_id)
 
                 tg_send(
                     chat_id,
-                    "✅ Я вижу, что ты вернулся из диагностики.\n\n"
+                    "✅ Я вижу, что ты вернулся(ась) из диагностики.\n\n"
                     "Скачал(а) PDF-отчёт?\n"
                     "Если да — покажу следующий шаг 👇",
                     buttons=[
@@ -421,20 +400,25 @@ async def tg_webhook(req: Request):
             )
             return {"ok": True}
 
-            # обычный старт без payload
-            tg_send(
-                chat_id,
-                "Привет! Я бот диагностики Personal Potentials.\n\nНажми кнопку — я выдам персональную ссылку 👇",
-                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
-            )
-            return {"ok": True}
+        # Если человек написал "превью" текстом — покажем превью по последнему token
+        if text.lower() in ("превью", "preview", "показать превью", "👀 показать превью"):
+            token = get_latest_token_for_chat(chat_id)
+            if not token:
+                tg_send(chat_id, "Я не вижу твою последнюю диагностику 😕 Нажми «✨ Начать» ещё раз.")
+                return {"ok": True}
 
-        # если человек написал "превью"
-        if text.lower() in ("превью", "preview"):
             tg_send(
                 chat_id,
-                "Ок 🙂\n\nЕсли ты заходил(а) из диагностики, нажми кнопку «Вернуться в Telegram» там ещё раз.\n"
-                "Или отправь мне токен (набор букв/цифр из ссылки) — я продолжу.",
+                "👀 <b>Превью расширенной версии</b>\n\n"
+                "Внутри будет:\n"
+                "✅ 1) Расширенный отчёт — глубже, точнее, с расшифровкой твоих механизмов\n"
+                "✅ 2) 3 фокуса на ближайшие недели (без воды)\n"
+                "✅ 3) Простая реализация: что делать каждый день, чтобы реально сдвинуться\n\n"
+                "Хочешь, я открою полный доступ?",
+                buttons=[
+                    [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
+                    [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
+                ],
             )
             return {"ok": True}
 
@@ -461,5 +445,4 @@ class CompleteIn(BaseModel):
 
 @app.post("/complete")
 def complete(inp: CompleteIn):
-    # оставили заглушку, чтобы ничего не ломалось, если где-то ещё дергается
     return {"ok": True, "note": "complete_not_used_in_current_flow"}
