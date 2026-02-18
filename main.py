@@ -285,24 +285,21 @@ async def tg_webhook(req: Request):
                 )
                 return {"ok": True}
 
-            # PREVIEW
-            if action.startswith("preview:"):
-                token = action.split("preview:", 1)[1].strip()
+            # --- Показать превью (поддерживаем и offer:, и preview:) ---
+            if action.startswith("offer:") or action.startswith("preview:"):
+                token = action.split(":", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
 
-                # ВАЖНО: тут лучше НЕ надеяться на кликабельность превью-картинки.
-                # Даем понятную кнопку и в тексте можно дать ссылку.
                 tg_send(
                     chat_id,
-                    "👀 <b>Превью расширенной версии</b>\n\n"
-                    "Внутри будет:\n"
+                "👀 <b>Превью расширенной версии</b>\n\n"
                     "✅ 1) Расширенный отчёт — глубже, точнее, с расшифровкой твоих механизмов\n"
                     "✅ 2) 3 фокуса на ближайшие недели (без воды)\n"
                     "✅ 3) Простая реализация: что делать каждый день, чтобы реально сдвинуться\n\n"
-                    "Если хочешь — я открою доступ одним кликом 👇",
+                    "Хочешь, я открою полный доступ?",
                     buttons=[
                         [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
-                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": "remind_later"}],
                     ],
                 )
                 return {"ok": True}
