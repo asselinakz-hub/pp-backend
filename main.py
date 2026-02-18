@@ -17,10 +17,10 @@ app = FastAPI()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")  # service role key
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_BOT_USERNAME = (os.getenv("TG_BOT_USERNAME", "") or "").lstrip("@").strip()
 
-APP_URL = os.getenv("APP_URL", "").rstrip("/")  # Streamlit URL, без / в конце
+APP_URL = (os.getenv("APP_URL", "") or "").rstrip("/")
 TG_GROUP_INVITE_LINK = os.getenv("TG_GROUP_INVITE_LINK", "")
-PAY_URL = os.getenv("PAY_URL", "")  # optional (не обязательно)
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
@@ -35,7 +35,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 TOKENS_TABLE = "link_tokens"
 
 
@@ -50,7 +49,7 @@ def tg_send(chat_id: str, text: str, buttons=None):
     if not TG_BOT_TOKEN:
         raise RuntimeError("Missing TG_BOT_TOKEN")
 
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
 
@@ -77,37 +76,39 @@ def issue_link(chat_id: str, source="tg", campaign=""):
             "campaign": campaign,
             "status": "issued",
             "created_at": utcnow_iso(),
+            "payment_status": None,
         }
     ).execute()
 
     return f"{APP_URL}/?t={token}"
 
 
-def get_token_row(token: str):
-    r = sb.table(TOKENS_TABLE).select("*").eq("token", token).limit(1).execute()
-    rows = r.data or []
-    return rows[0] if rows else None
-
-
-def ensure_token_chat_link(token: str, chat_id: str):
-    # привязываем токен к чату (на случай если tg_chat_id пустой)
+def upsert_chat_for_token(token: str, chat_id: str):
     try:
         sb.table(TOKENS_TABLE).update({"tg_chat_id": str(chat_id)}).eq("token", token).execute()
     except Exception:
         pass
 
 
-def create_stripe_checkout(token: str, chat_id: str):
+def build_tg_return_link(token: str) -> str:
+    # в start payload нельзя пробелы, лучше не усложнять
+    # Telegram допускает payload до 64 символов — наш token_urlsafe обычно ок
+    if not TG_BOT_USERNAME:
+        return "https://t.me/"
+    return f"https://t.me/{TG_BOT_USERNAME}?start={token}"
+
+
+def create_checkout_for_token(token: str, chat_id: str) -> str:
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
-        raise RuntimeError("stripe_not_configured")
+        raise HTTPException(status_code=500, detail="stripe_not_configured")
 
-    row = get_token_row(token)
+    r = sb.table(TOKENS_TABLE).select("*").eq("token", token).limit(1).execute()
+    row = (r.data or [None])[0]
     if not row:
-        raise RuntimeError("token_not_found")
+        raise HTTPException(status_code=404, detail="token_not_found")
 
-    # если уже оплачено — можно не создавать повторно
     if row.get("payment_status") == "paid":
-        return None, None
+        return ""
 
     session = stripe.checkout.Session.create(
         mode="payment",
@@ -121,7 +122,7 @@ def create_stripe_checkout(token: str, chat_id: str):
         {"stripe_session_id": session.id, "payment_status": "pending"}
     ).eq("token", token).execute()
 
-    return session.url, session.id
+    return session.url
 
 
 # -------------------------
@@ -133,14 +134,14 @@ def health():
 
 
 # -------------------------
-# Token status API (для проверки)
+# Token status API
 # -------------------------
 @app.get("/api/token/{token}")
-def api_get_token(token: str):
+def get_token(token: str):
     try:
         r = (
             sb.table(TOKENS_TABLE)
-            .select("token,status,created_at,completed_at,session_id,tg_chat_id,source,campaign,payment_status,paid_at")
+            .select("token,status,created_at,completed_at,session_id,tg_chat_id,source,campaign,payment_status")
             .eq("token", token)
             .limit(1)
             .execute()
@@ -156,28 +157,7 @@ def api_get_token(token: str):
 
 
 # -------------------------
-# Stripe: create checkout (optional endpoint)
-# -------------------------
-@app.post("/pay/create-checkout")
-def pay_create_checkout(token: str):
-    try:
-        row = get_token_row(token)
-        if not row:
-            raise HTTPException(status_code=404, detail="token_not_found")
-
-        if row.get("payment_status") == "paid":
-            return {"ok": True, "already_paid": True, "checkout_url": None}
-
-        checkout_url, session_id = create_stripe_checkout(token, row.get("tg_chat_id") or "")
-        return {"ok": True, "checkout_url": checkout_url, "session_id": session_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"create_checkout_error: {e}")
-
-
-# -------------------------
-# Stripe webhook
+# Stripe Webhook
 # -------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -198,9 +178,8 @@ async def stripe_webhook(request: Request):
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        meta = session.get("metadata") or {}
-        token = (meta.get("token") or "").strip()
-        tg_chat_id = (meta.get("tg_chat_id") or "").strip()
+        token = (session.get("metadata") or {}).get("token")
+        tg_chat_id = (session.get("metadata") or {}).get("tg_chat_id")
 
         if token:
             sb.table(TOKENS_TABLE).update(
@@ -220,8 +199,8 @@ async def stripe_webhook(request: Request):
                 buttons.append([{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}])
 
             tg_send(
-                tg_chat_id,
-                "✅ Оплата прошла!\n\nЯ открыла доступ — нажми кнопку ниже:",
+                str(tg_chat_id),
+                "✅ Оплата прошла!\n\nЯ открыла доступ к расширенным материалам. Нажми кнопку ниже 👇",
                 buttons=buttons,
             )
 
@@ -235,19 +214,19 @@ async def stripe_webhook(request: Request):
 async def tg_webhook(req: Request):
     try:
         data = await req.json()
+        msg = data.get("message") or (data.get("callback_query") or {}).get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
 
-        # 1) callback (нажатие кнопок)
+        if not chat_id:
+            return {"ok": True}
+
+        # ---------- CALLBACKS ----------
         cb = data.get("callback_query")
         if cb:
-            msg = cb.get("message") or {}
-            chat = msg.get("chat") or {}
-            chat_id = str(chat.get("id") or "")
             action = (cb.get("data") or "").strip()
 
-            if not chat_id:
-                return {"ok": True}
-
-            # start diag
+            # старт диагностики
             if action == "start_diag":
                 link = issue_link(chat_id, source="tg")
                 tg_send(
@@ -257,154 +236,163 @@ async def tg_webhook(req: Request):
                 )
                 return {"ok": True}
 
-            # user says: "I finished"
-            if action.startswith("done:"):
-                token = action.split("done:", 1)[1].strip()
-                if token:
-                    ensure_token_chat_link(token, chat_id)
+            # пользователь: "да, PDF скачал"
+            if action.startswith("pdf_ok:"):
+                token = action.split("pdf_ok:", 1)[1].strip()
+                upsert_chat_for_token(token, chat_id)
 
                 tg_send(
                     chat_id,
-                    "🔥 Супер, ты почти на финише.\n\n"
-                    "Хочешь, покажу «что внутри» расширенной версии? Без оплаты — просто превью.\n\n"
-                    "Там:\n"
-                    "• расширенный отчёт (глубже)\n"
-                    "• 3 фокуса\n"
-                    "• реализация: что делать каждый день",
+                    "Супер ✅\n\n"
+                    "Тогда самый интересный вопрос: хочешь увидеть <b>превью</b> расширенного отчёта?\n\n"
+                    "Я покажу, какие блоки там есть и чем он отличается от бесплатного.",
                     buttons=[
-                        [{"text": "👀 Посмотреть превью", "callback_data": f"offer:{token}"}],
-                        [{"text": "📌 Напомнить позже", "callback_data": "remind_later"}],
+                        [{"text": "👀 Показать превью", "callback_data": f"preview:{token}"}],
+                        [{"text": "🕒 Напомнить позже", "callback_data": f"later:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # preview offer
-            if action.startswith("offer:"):
-                token = action.split("offer:", 1)[1].strip()
-                if token:
-                    ensure_token_chat_link(token, chat_id)
+            # превью расширения (мягко, без цены в лоб)
+            if action.startswith("preview:"):
+                token = action.split("preview:", 1)[1].strip()
+                upsert_chat_for_token(token, chat_id)
 
                 tg_send(
                     chat_id,
-                    "👀 Превью расширения:\n\n"
-                    "✅ Сильные стороны — без воды, с примерами\n"
-                    "✅ Где ты теряешь энергию и почему\n"
-                    "✅ 3 фокуса на ближайшие недели\n"
-                    "✅ Мини-план действий (очень понятный)\n\n"
-                    "Если хочешь — открою полный доступ.",
+                    "👀 <b>Превью расширенной версии</b>\n\n"
+                    "Внутри будет:\n"
+                    "• более точная расшифровка твоих сильных сторон (на языке поведения)\n"
+                    "• где ты теряешь энергию и почему\n"
+                    "• 3 фокуса на ближайшие недели\n"
+                    "• «реализация» — понятный план действий\n\n"
+                    "Если хочешь — я открою доступ одним кликом.",
                     buttons=[
-                        [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
-                        [{"text": "↩️ Я ещё прохожу", "callback_data": f"resume:{token}"}],
+                        [{"text": "💎 Хочу открыть доступ", "callback_data": f"unlock:{token}"}],
+                        [{"text": "↩️ Вернуться", "callback_data": f"welcome:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # resume diagnostic
-            if action.startswith("resume:"):
-                token = action.split("resume:", 1)[1].strip()
-                if token:
-                    ensure_token_chat_link(token, chat_id)
-
-                tg_send(
-                    chat_id,
-                    "Ок 🙂 Продолжай диагностику тут:",
-                    buttons=[[{"text": "▶️ Продолжить диагностику", "url": f"{APP_URL}/?t={token}"}]],
-                )
-                return {"ok": True}
-
-            # pay -> create checkout now
-            if action.startswith("pay:"):
-                token = action.split("pay:", 1)[1].strip()
-                if token:
-                    ensure_token_chat_link(token, chat_id)
+            # только тут создаём оплату
+            if action.startswith("unlock:"):
+                token = action.split("unlock:", 1)[1].strip()
+                upsert_chat_for_token(token, chat_id)
 
                 try:
-                    checkout_url, _sid = create_stripe_checkout(token, chat_id)
+                    checkout_url = create_checkout_for_token(token, chat_id)
+                except Exception:
+                    tg_send(chat_id, "Оплата пока не настроена 😕 Попробуй чуть позже.")
+                    return {"ok": True}
 
-                    if not checkout_url:
-                        tg_send(
-                            chat_id,
-                            "Похоже, доступ уже активирован ✅\n\nНажми «Открыть платформу».",
-                            buttons=[[{"text": "💠 Открыть платформу", "url": APP_URL}]],
-                        )
-                        return {"ok": True}
-
-                    tg_send(
-                        chat_id,
-                        "Готово ✅ Я подготовила оплату.\n\n"
-                        "После оплаты я сразу открою доступ и отправлю материалы.",
-                        buttons=[
-                            [{"text": "💳 Перейти к оплате", "url": checkout_url}],
-                            *([[{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}]] if TG_GROUP_INVITE_LINK else []),
-                        ],
-                    )
-                except Exception as e:
-                    tg_send(chat_id, f"Не смогла создать оплату 😕 ({e})")
-
-                return {"ok": True}
-
-            # remind later
-            if action == "remind_later":
-                tg_send(chat_id, "Ок 🙂 Когда будешь готов — напиши в чат слово: превью")
-                return {"ok": True}
-
-            return {"ok": True}
-
-        # 2) обычный текст (сообщения)
-        msg = data.get("message") or {}
-        chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
-        text = (msg.get("text") or "").strip()
-
-        if not chat_id:
-            return {"ok": True}
-
-        # /start with optional token payload
-        if text.startswith("/start"):
-            parts = text.split(maxsplit=1)
-            start_payload = parts[1].strip() if len(parts) > 1 else ""
-
-            if start_payload:
-                token = start_payload
-                ensure_token_chat_link(token, chat_id)
+                if not checkout_url:
+                    tg_send(chat_id, "Похоже, доступ уже оплачен ✅")
+                    return {"ok": True}
 
                 tg_send(
                     chat_id,
-                    "Ты вернулся из диагностики ✅\n\n"
-                    "Если ты ещё проходишь — нажми «Продолжить».\n"
-                    "Если уже закончил — нажми «Я прошёл ✅».",
+                    "Готово ✅\n\n"
+                    "Я подготовила оплату. После оплаты я автоматически пришлю доступ.",
                     buttons=[
-                        [{"text": "▶️ Продолжить диагностику", "url": f"{APP_URL}/?t={token}"}],
-                        [{"text": "✅ Я прошёл", "callback_data": f"done:{token}"}],
+                        [{"text": "💳 Перейти к оплате", "url": checkout_url}],
+                        [{"text": "🕒 Подумать позже", "callback_data": f"later:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # обычный старт без токена
+            # напомнить позже
+            if action.startswith("later:"):
+                token = action.split("later:", 1)[1].strip()
+                tg_send(
+                    chat_id,
+                    "Ок 🙂\n\n"
+                    "Когда будешь готов — просто напиши <b>превью</b> (и я покажу ещё раз).",
+                )
+                return {"ok": True}
+
+            # повторить “welcome”
+            if action.startswith("welcome:"):
+                token = action.split("welcome:", 1)[1].strip()
+                upsert_chat_for_token(token, chat_id)
+
+                tg_send(
+                    chat_id,
+                    "✅ Ты вернулся из диагностики.\n\n"
+                    "Небольшой момент: ты успел(а) скачать PDF?\n\n"
+                    "Если нет — открою диагностику снова на твоей ссылке.",
+                    buttons=[
+                        [{"text": "📄 Я скачал(а) PDF", "callback_data": f"pdf_ok:{token}"}],
+                        [{"text": "↩️ Открыть PDF ещё раз", "url": f"{APP_URL}/?t={token}"}],
+                    ],
+                )
+                return {"ok": True}
+
+            return {"ok": True}
+
+        # ---------- TEXT MESSAGES ----------
+        text = (data.get("message", {}) or {}).get("text", "") or ""
+        text = text.strip()
+
+        # /start (с payload или без)
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+
+            if payload:
+                token = payload
+                upsert_chat_for_token(token, chat_id)
+
+                tg_send(
+                    chat_id,
+                    "✨ <b>Ты на финише!</b>\n\n"
+                    "Судя по всему, ты вернулся(лась) после диагностики.\n\n"
+                    "Скажи честно: PDF уже скачал(а)?",
+                    buttons=[
+                        [{"text": "📄 Да, скачал(а)", "callback_data": f"pdf_ok:{token}"}],
+                        [{"text": "↩️ Открыть PDF ещё раз", "url": f"{APP_URL}/?t={token}"}],
+                    ],
+                )
+                return {"ok": True}
+
+            # обычный старт без payload
             tg_send(
                 chat_id,
-                "Привет! Я бот диагностики Personal Potentials.\n\nНажми кнопку — я выдам персональную ссылку.",
+                "Привет! Я бот диагностики Personal Potentials.\n\nНажми кнопку — я выдам персональную ссылку 👇",
                 buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
             )
             return {"ok": True}
 
-        # слово "превью" (на случай remind later)
+        # если человек написал "превью"
         if text.lower() in ("превью", "preview"):
             tg_send(
                 chat_id,
-                "Ок 🙂 Скажи, пожалуйста: ты уже прошёл диагностику?\n\n"
-                "Если да — отправь мне команду /start <твой_токен>\n"
-                "Её можно получить из ссылки диагностики (параметр t=...)."
+                "Ок 🙂\n\nЕсли ты заходил(а) из диагностики, нажми кнопку «Вернуться в Telegram» там ещё раз.\n"
+                "Или отправь мне токен (набор букв/цифр из ссылки) — я продолжу.",
             )
             return {"ok": True}
 
-        # fallback
+        # дефолт
         tg_send(
             chat_id,
-            "Нажми «✨ Начать», и я выдам персональную ссылку.",
+            "Нажми «✨ Начать», и я выдам персональную ссылку на диагностику.",
             buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
         )
         return {"ok": True}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"webhook_error: {e}")
+
+
+# -------------------------
+# (Не используем) complete endpoint — можно оставить на будущее
+# -------------------------
+class CompleteIn(BaseModel):
+    token: str
+    session_id: str
+    client_name: str | None = "Клиент"
+
+
+@app.post("/complete")
+def complete(inp: CompleteIn):
+    # оставили заглушку, чтобы ничего не ломалось, если где-то ещё дергается
+    return {"ok": True, "note": "complete_not_used_in_current_flow"}
