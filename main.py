@@ -306,27 +306,18 @@ async def tg_webhook(req: Request):
 
             # PAY (создаем оплату)
             if action.startswith("pay:"):
-                token = action.split("pay:", 1)[1].strip()
-                upsert_chat_for_token(token, chat_id)
+                MANUAL_PAY_LINK = (os.getenv("MANUAL_PAY_LINK", "") or "").strip()
 
-                try:
-                    checkout_url = create_checkout_for_token(token, chat_id)
-                except Exception:
-                    tg_send(chat_id, "Оплата пока не настроена 😕 Попробуй чуть позже.")
-                    return {"ok": True}
-
-                if not checkout_url:
-                    tg_send(chat_id, "Похоже, доступ уже оплачен ✅")
+                if not MANUAL_PAY_LINK:
+                    tg_send(chat_id, "Ссылка на оплату ещё не настроена 😕")
                     return {"ok": True}
 
                 tg_send(
                     chat_id,
                     "Готово ✅\n\n"
-                    "Перейди к оплате по кнопке ниже. После оплаты я автоматически пришлю доступ.",
-                    buttons=[
-                        [{"text": "💳 Перейти к оплате", "url": checkout_url}],
-                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
-                    ],
+                    "Нажми кнопку ниже, чтобы оплатить доступ.\n"
+                    "После оплаты просто напиши: «Оплатил(а)» — и я открою доступ вручную.",
+                    buttons=[[{"text": "💳 Оплатить доступ", "url": MANUAL_PAY_LINK}]],
                 )
                 return {"ok": True}
 
