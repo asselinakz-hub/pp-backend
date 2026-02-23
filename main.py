@@ -181,9 +181,10 @@ def get_token(token: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"server_error: {e}")
-
-
+        # ВАЖНО: Telegram всегда должен получать 200 OK,
+        # иначе он будет копить pending updates и бот "умирает".
+        print("TG_WEBHOOK_ERROR:", repr(e))
+        return {"ok": True}
 # -------------------------
 # Stripe Webhook
 # -------------------------
