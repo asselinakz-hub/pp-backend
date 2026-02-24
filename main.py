@@ -428,13 +428,13 @@ async def tg_webhook(req: Request):
                 )
                 return {"ok": True}
 
-    # ✅ обычный /start без токена
-    tg_send(
-        chat_id,
-        "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
-        buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
-    )
-    return {"ok": True}
+            # ✅ обычный /start без токена
+            tg_send(
+                chat_id,
+                "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
+                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
+            )
+            return {"ok": True}
         # "превью"
         if text.lower() in ("превью", "preview", "показать превью"):
             try:
