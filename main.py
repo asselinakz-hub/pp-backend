@@ -348,25 +348,35 @@ async def tg_webhook(req: Request):
                 return {"ok": True}
 
             # PAY (AUTO)
+            # PAY (создаем оплату через Stripe Checkout)
             if action.startswith("pay:"):
                 token = action.split("pay:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
 
                 try:
                     checkout_url = create_checkout_for_token(token, chat_id)
+
                     if not checkout_url:
-                        tg_send(chat_id, "Похоже, доступ уже оплачен ✅")
+                        # уже оплачено
+                        tg_send(
+                            chat_id,
+                            "✅ Похоже, доступ уже оплачен.\n\nНажми кнопку ниже 👇",
+                            buttons=[[{"text": "💠 Открыть платформу", "url": APP_URL}]],
+                        )
                         return {"ok": True}
 
                     tg_send(
                         chat_id,
-                        "Готово ✅\n\nПерейди к оплате по кнопке ниже. После оплаты я пришлю доступ автоматически.",
-                        buttons=[[{"text": "💳 Перейти к оплате", "url": checkout_url}]],
+                        "💳 Готово!\n\nНажми кнопку ниже, чтобы оплатить доступ 👇",
+                        buttons=[[{"text": "💳 Оплатить доступ", "url": checkout_url}]],
                     )
+                    return {"ok": True}
+
                 except Exception as e:
-                    log("create_checkout_for_token failed:", repr(e))
+                    # важно: не падать 500 для Telegram
+                    print("PAY_ERROR:", repr(e))
                     tg_send(chat_id, "Оплата пока не настроена 😕 (ошибка на сервере).")
-                return {"ok": True}
+                    return {"ok": True}
 
             # LATER
             if action.startswith("later:") or action == "remind_later":
