@@ -422,7 +422,11 @@ async def tg_webhook(req: Request):
                     ],
                 )
                 return {"ok": True}
-
+            
+            # Stripe возвращает /start paid или /start cancel — это НЕ токен диагностики
+            if start_payload.lower() in ("paid", "cancel"):
+                return {"ok": True}
+            
             # обычный /start без токена
             tg_send(
                 chat_id,
