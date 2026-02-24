@@ -292,12 +292,21 @@ async def tg_webhook(req: Request):
 
             # START DIAG
             if action == "start_diag":
-                link = issue_link(chat_id, source="tg")
-                tg_send(
-                    chat_id,
-                    "Отлично! Вот твоя персональная ссылка на диагностику 👇",
-                    buttons=[[{"text": "🚀 Начать диагностику", "url": link}]],
-                )
+                try:
+                    link = issue_link(chat_id, source="tg")
+                except Exception as e:
+                    print("START_DIAG_ERROR:", repr(e))
+                    tg_send(chat_id, "⚠️ Не могу выдать ссылку на диагностику (ошибка на сервере). Я уже чиню.")
+                    return {"ok": True}
+
+                try:
+                    tg_send(
+                        chat_id,
+                        "Отлично! Вот твоя персональная ссылка на диагностику 👇",
+                        buttons=[[{"text": "🚀 Начать диагностику", "url": link}]],
+                    )
+                except Exception as e:
+                    print("TG_SEND_ERROR:", repr(e))
                 return {"ok": True}
 
             # PDF OK
