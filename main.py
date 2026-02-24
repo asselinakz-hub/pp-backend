@@ -21,7 +21,7 @@ TG_BOT_USERNAME = (os.getenv("TG_BOT_USERNAME", "") or "").lstrip("@").strip()
 
 APP_URL = (os.getenv("APP_URL", "") or "").rstrip("/")
 TG_GROUP_INVITE_LINK = (os.getenv("TG_GROUP_INVITE_LINK", "") or "").strip()
-
+PLATFORM_URL = (os.getenv("PLATFORM_URL", "") or "").rstrip("/")
 STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY", "") or "").strip()
 STRIPE_WEBHOOK_SECRET = (os.getenv("STRIPE_WEBHOOK_SECRET", "") or "").strip()
 STRIPE_PRICE_ID = (os.getenv("STRIPE_PRICE_ID", "") or "").strip()
@@ -255,7 +255,11 @@ async def stripe_webhook(request: Request):
 
             if tg_chat_id:
                 try:
-                    buttons = [[{"text": "💠 Открыть платформу", "url": APP_URL or "https://example.com"}]]
+                    platform_base = PLATFORM_URL or APP_URL or "https://example.com"
+                    platform_link = f"{platform_base}/?t={token}&paid=1" if token else platform_base
+
+                    buttons = [[{"text": "💠 Открыть платформу", "url": platform_link}]]
+                    
                     if TG_GROUP_INVITE_LINK:
                         buttons.append([{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}])
 
@@ -358,10 +362,13 @@ async def tg_webhook(req: Request):
 
                     if not checkout_url:
                         # уже оплачено
+                        platform_base = PLATFORM_URL or APP_URL or "https://example.com"
+                        platform_link = f"{platform_base}/?t={token}&paid=1" if token else platform_base
+
                         tg_send(
                             chat_id,
                             "✅ Похоже, доступ уже оплачен.\n\nНажми кнопку ниже 👇",
-                            buttons=[[{"text": "💠 Открыть платформу", "url": APP_URL}]],
+                            buttons=[[{"text": "💠 Открыть платформу", "url": platform_link}]],
                         )
                         return {"ok": True}
 
