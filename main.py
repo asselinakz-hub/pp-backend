@@ -407,7 +407,12 @@ async def tg_webhook(req: Request):
             parts = text.split(maxsplit=1)
             start_payload = parts[1].strip() if len(parts) > 1 else ""
 
-            # Если пришли с токеном (возврат из диагностики)
+            # ✅ Stripe редиректит в бот как /start paid или /start cancel
+            # Мы это игнорируем, чтобы не было "вернулась из диагностики"
+            if start_payload.lower() in ("paid", "cancel"):
+                return {"ok": True}
+
+            # ✅ Если пришли с токеном (возврат из диагностики)
             if start_payload:
                 token = start_payload
                 upsert_chat_for_token(token, chat_id)
@@ -418,23 +423,18 @@ async def tg_webhook(req: Request):
                     "Ты скачала PDF?\n"
                     "Если да — покажу следующий шаг 👇",
                     buttons=[
-                        [{"text": "📥 Я скачала PDF", "callback_data": f"pdf_ok:{token}"}],
+                        [{"text": "Я скачала PDF", "callback_data": f"pdf_ok:{token}"}],
                     ],
                 )
                 return {"ok": True}
-            
-            # Stripe возвращает /start paid или /start cancel — это НЕ токен диагностики
-            if start_payload.lower() in ("paid", "cancel"):
-                return {"ok": True}
-            
-            # обычный /start без токена
-            tg_send(
-                chat_id,
-                "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
-                buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
-            )
-            return {"ok": True}
 
+    # ✅ обычный /start без токена
+    tg_send(
+        chat_id,
+        "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
+        buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
+    )
+    return {"ok": True}
         # "превью"
         if text.lower() in ("превью", "preview", "показать превью"):
             try:
