@@ -1,6 +1,6 @@
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import stripe
@@ -48,7 +48,6 @@ def utcnow_iso() -> str:
 
 
 def log(*args):
-    # Render logs
     print("[pp-backend]", *args, flush=True)
 
 
@@ -112,7 +111,6 @@ def issue_link(chat_id: str, source="tg", campaign="") -> str:
         "payment_status": "unpaid",
     }
 
-    # ВАЖНО: если у тебя в таблице нет каких-то полей — удали их тут
     sb.table(TOKENS_TABLE).insert(row).execute()
 
     return f"{APP_URL}/?t={token}"
@@ -141,7 +139,6 @@ def get_latest_token_for_chat(chat_id: str) -> str | None:
 
 
 def _fallback_url() -> str:
-    # Stripe требует абсолютные URL
     if API_BASE_URL:
         return f"{API_BASE_URL}/health"
     return "https://example.com"
@@ -153,7 +150,6 @@ def create_checkout_for_token(token: str, chat_id: str) -> str:
         raise RuntimeError("Stripe is not configured (missing STRIPE_SECRET_KEY / STRIPE_PRICE_ID)")
     safe_supabase_check()
 
-    # если уже paid — не создаём заново
     r = sb.table(TOKENS_TABLE).select("payment_status").eq("token", token).limit(1).execute()
     row = (r.data or [None])[0]
     if not row:
@@ -179,6 +175,17 @@ def create_checkout_for_token(token: str, chat_id: str) -> str:
     return session.url
 
 
+def schedule_reminder(token: str, remind_type: str = "preview_20"):
+    """Записываем напоминание (потом /jobs/reminders реально отправит)."""
+    safe_supabase_check()
+    try:
+        sb.table(TOKENS_TABLE).update(
+            {"remind_after": utcnow_iso(), "remind_type": remind_type}
+        ).eq("token", token).execute()
+    except Exception as e:
+        log("schedule_reminder failed:", repr(e))
+
+
 # -------------------------
 # Health / Debug
 # -------------------------
@@ -190,7 +197,6 @@ def health():
     # 2) Трогаем Supabase (чтобы Supabase не поставил проект на паузу)
     if sb:
         try:
-            # самый дешёвый “пинг”: прочитать 1 строку
             sb.table(TOKENS_TABLE).select("token").limit(1).execute()
             resp["supabase"] = "ok"
         except Exception as e:
@@ -201,9 +207,9 @@ def health():
 
     return resp
 
+
 @app.get("/debug/env")
 def debug_env():
-    # безопасно: без секретов
     mode = "unset"
     if STRIPE_SECRET_KEY.startswith("sk_test_"):
         mode = "test"
@@ -222,11 +228,102 @@ def debug_env():
 
 
 # -------------------------
+# Reminders job (cron calls this)
+# -------------------------
+@app.post("/jobs/reminders")
+def job_reminders():
+    """
+    Вызывается кроном раз в 5 минут.
+    Реально шлёт напоминания через 20 минут после remind_after.
+    """
+    try:
+        safe_supabase_check()
+        now = datetime.now(timezone.utc)
+
+        r = (
+            sb.table(TOKENS_TABLE)
+            .select("token,tg_chat_id,remind_after,remind_type,payment_status")
+            .not_.is_("remind_type", "null")
+            .execute()
+        )
+
+        rows = r.data or []
+        sent = 0
+
+        for row in rows:
+            token = row.get("token")
+            chat_id = row.get("tg_chat_id")
+            remind_type = row.get("remind_type")
+            payment_status = (row.get("payment_status") or "").lower()
+
+            if not token:
+                continue
+
+            # если оплачено — сбрасываем напоминание
+            if payment_status == "paid":
+                try:
+                    sb.table(TOKENS_TABLE).update({"remind_type": None, "remind_after": None}).eq("token", token).execute()
+                except Exception:
+                    pass
+                continue
+
+            if remind_type != "preview_20":
+                continue
+
+            ra = row.get("remind_after")
+            if not ra:
+                continue
+
+            try:
+                ra_dt = datetime.fromisoformat(ra.replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            if now < (ra_dt + timedelta(minutes=20)):
+                continue
+
+            if not chat_id:
+                # некуда отправить — сбросим
+                try:
+                    sb.table(TOKENS_TABLE).update({"remind_type": None, "remind_after": None}).eq("token", token).execute()
+                except Exception:
+                    pass
+                continue
+
+            # отправляем напоминание
+            try:
+                tg_send(
+                    str(chat_id),
+                    "Напоминаю про превью 👀\n\n"
+                    "Хочешь открыть полный доступ?\n"
+                    "Там 3 фокуса + план действий на каждый день.",
+                    buttons=[
+                        [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
+                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
+                    ],
+                )
+                sent += 1
+            except Exception as e:
+                log("job_reminders tg_send failed:", repr(e))
+
+            # сбросим напоминание, чтобы не спамить
+            try:
+                sb.table(TOKENS_TABLE).update({"remind_type": None, "remind_after": None}).eq("token", token).execute()
+            except Exception as e:
+                log("job_reminders reset failed:", repr(e))
+
+        return {"ok": True, "sent": sent}
+
+    except Exception as e:
+        log("job_reminders failed:", repr(e))
+        return {"ok": False}
+
+
+# -------------------------
 # Stripe Webhook
 # -------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    # Stripe должен получить 2xx
     try:
         if not STRIPE_WEBHOOK_SECRET:
             log("missing STRIPE_WEBHOOK_SECRET")
@@ -243,7 +340,6 @@ async def stripe_webhook(request: Request):
             )
         except Exception as e:
             log("invalid_webhook:", repr(e))
-            # Stripe ожидает 400 на неверную подпись — ок
             return JSONResponse({"error": "invalid_webhook"}, status_code=400)
 
         if event.get("type") == "checkout.session.completed":
@@ -262,6 +358,8 @@ async def stripe_webhook(request: Request):
                             "stripe_session_id": session.get("id"),
                             "stripe_customer_email": (session.get("customer_details") or {}).get("email"),
                             "status": "paid",
+                            "remind_type": None,
+                            "remind_after": None,
                         }
                     ).eq("token", token).execute()
                 except Exception as e:
@@ -273,13 +371,16 @@ async def stripe_webhook(request: Request):
                     platform_link = f"{platform_base}/?t={token}&paid=1" if token else platform_base
 
                     buttons = [[{"text": "💠 Открыть платформу", "url": platform_link}]]
-                    
+
                     if TG_GROUP_INVITE_LINK:
                         buttons.append([{"text": "👥 Войти в клуб", "url": TG_GROUP_INVITE_LINK}])
 
                     tg_send(
                         str(tg_chat_id),
-                        "✅ Оплата прошла!\n\nЯ открыла доступ. Нажми кнопку ниже 👇",
+                        "✅ Оплата прошла!\n\n"
+                        "1) Открой платформу\n"
+                        "2) Выбери фокус\n"
+                        "3) Получи действия на сегодня 👇",
                         buttons=buttons,
                     )
                 except Exception as e:
@@ -297,14 +398,12 @@ async def stripe_webhook(request: Request):
 # -------------------------
 @app.post("/tg/webhook")
 async def tg_webhook(req: Request):
-    # КРИТИЧНО: Telegram всегда должен получать 200 OK
     try:
         data = await req.json()
     except Exception:
         return {"ok": True}
 
     try:
-        # callback buttons
         cb = data.get("callback_query")
         if cb:
             cb_id = cb.get("id", "")
@@ -354,19 +453,30 @@ async def tg_webhook(req: Request):
                 tg_send(
                     chat_id,
                     "👀 <b>Превью расширенной версии</b>\n\n"
-                    "✅ 1) Расширенный отчёт — глубже, точнее\n"
-                    "✅ 2) 3 фокуса на ближайшие недели\n"
-                    "✅ 3) Простая реализация: что делать каждый день\n\n"
-                    "Хочешь открыть полный доступ?",
+                    "Вот что ты получишь в полной версии:\n"
+                    "✅ 1) Расширенный отчёт — глубже и точнее\n"
+                    "✅ 2) 3 фокуса реализации на ближайшие недели\n"
+                    "✅ 3) План действий: что делать каждый день\n\n"
+                    "Если хочешь — открою доступ сразу после оплаты 👇",
                     buttons=[
                         [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
-                        [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
+                        [{"text": "⏳ Напомнить позже", "callback_data": f"remind20:{token}"}],
                     ],
                 )
                 return {"ok": True}
 
-            # PAY (AUTO)
-            # PAY (создаем оплату через Stripe Checkout)
+            # REMIND 20
+            if action.startswith("remind20:"):
+                token = action.split("remind20:", 1)[1].strip()
+                upsert_chat_for_token(token, chat_id)
+                try:
+                    schedule_reminder(token, "preview_20")
+                except Exception as e:
+                    log("remind20 schedule failed:", repr(e))
+                tg_send(chat_id, "Ок 🙂 Напомню тебе через 20 минут.")
+                return {"ok": True}
+
+            # PAY
             if action.startswith("pay:"):
                 token = action.split("pay:", 1)[1].strip()
                 upsert_chat_for_token(token, chat_id)
@@ -375,7 +485,6 @@ async def tg_webhook(req: Request):
                     checkout_url = create_checkout_for_token(token, chat_id)
 
                     if not checkout_url:
-                        # уже оплачено
                         platform_base = PLATFORM_URL or APP_URL or "https://example.com"
                         platform_link = f"{platform_base}/?t={token}&paid=1" if token else platform_base
 
@@ -388,14 +497,18 @@ async def tg_webhook(req: Request):
 
                     tg_send(
                         chat_id,
-                        "💳 Готово!\n\nНажми кнопку ниже, чтобы оплатить доступ 👇",
+                        "💎 <b>Открываем полный доступ</b>\n\n"
+                        "После оплаты ты получишь:\n"
+                        "• полный расширенный отчёт\n"
+                        "• 3 фокуса реализации\n"
+                        "• план действий на каждый день\n\n"
+                        "Оплата занимает ~30 секунд 👇",
                         buttons=[[{"text": "💳 Оплатить доступ", "url": checkout_url}]],
                     )
                     return {"ok": True}
 
                 except Exception as e:
-                    # важно: не падать 500 для Telegram
-                    print("PAY_ERROR:", repr(e))
+                    log("PAY_ERROR:", repr(e))
                     tg_send(chat_id, "Оплата пока не настроена 😕 (ошибка на сервере).")
                     return {"ok": True}
 
@@ -415,18 +528,14 @@ async def tg_webhook(req: Request):
         if not chat_id:
             return {"ok": True}
 
-        # /start (без токена)
-        # /start (с возможным токеном)
+        # /start
         if text.startswith("/start"):
             parts = text.split(maxsplit=1)
             start_payload = parts[1].strip() if len(parts) > 1 else ""
 
-            # ✅ Stripe редиректит в бот как /start paid или /start cancel
-            # Мы это игнорируем, чтобы не было "вернулась из диагностики"
             if start_payload.lower() in ("paid", "cancel"):
                 return {"ok": True}
 
-            # ✅ Если пришли с токеном (возврат из диагностики)
             if start_payload:
                 token = start_payload
                 upsert_chat_for_token(token, chat_id)
@@ -442,13 +551,13 @@ async def tg_webhook(req: Request):
                 )
                 return {"ok": True}
 
-            # ✅ обычный /start без токена
             tg_send(
                 chat_id,
                 "Привет! Нажми кнопку — я выдам персональную ссылку на диагностику 👇",
                 buttons=[[{"text": "✨ Начать", "callback_data": "start_diag"}]],
             )
             return {"ok": True}
+
         # "превью"
         if text.lower() in ("превью", "preview", "показать превью"):
             try:
@@ -464,13 +573,14 @@ async def tg_webhook(req: Request):
             tg_send(
                 chat_id,
                 "👀 <b>Превью расширенной версии</b>\n\n"
-                "✅ 1) Расширенный отчёт — глубже, точнее\n"
-                "✅ 2) 3 фокуса на ближайшие недели\n"
-                "✅ 3) Простая реализация: что делать каждый день\n\n"
-                "Хочешь открыть полный доступ?",
+                "Вот что ты получишь в полной версии:\n"
+                "✅ 1) Расширенный отчёт — глубже и точнее\n"
+                "✅ 2) 3 фокуса реализации на ближайшие недели\n"
+                "✅ 3) План действий: что делать каждый день\n\n"
+                "Если хочешь — открою доступ сразу после оплаты 👇",
                 buttons=[
                     [{"text": "💎 Открыть полный доступ", "callback_data": f"pay:{token}"}],
-                    [{"text": "⏳ Позже", "callback_data": f"later:{token}"}],
+                    [{"text": "⏳ Напомнить позже", "callback_data": f"remind20:{token}"}],
                 ],
             )
             return {"ok": True}
@@ -485,5 +595,4 @@ async def tg_webhook(req: Request):
 
     except Exception as e:
         log("tg_webhook fatal:", repr(e))
-        # главное — не отдавать 500
         return {"ok": True}
