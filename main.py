@@ -184,8 +184,22 @@ def create_checkout_for_token(token: str, chat_id: str) -> str:
 # -------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # 1) Будим Render
+    resp = {"ok": True, "ts": utcnow_iso()}
 
+    # 2) Трогаем Supabase (чтобы Supabase не поставил проект на паузу)
+    if sb:
+        try:
+            # самый дешёвый “пинг”: прочитать 1 строку
+            sb.table(TOKENS_TABLE).select("token").limit(1).execute()
+            resp["supabase"] = "ok"
+        except Exception as e:
+            log("health supabase ping failed:", repr(e))
+            resp["supabase"] = "error"
+    else:
+        resp["supabase"] = "not_configured"
+
+    return resp
 
 @app.get("/debug/env")
 def debug_env():
